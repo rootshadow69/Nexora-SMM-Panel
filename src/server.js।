@@ -1,0 +1,307 @@
+
+import 'dotenv/config';
+import express from 'express';
+import helmet from 'helmet';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import pg from 'pg';
+
+const { Pool } = pg;
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(helmet());
+app.use(express.json({ limit: '20kb' }));
+
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_SSL === 'true'
+        ? { rejectUnauthorized: false }
+        : undefined
+    })
+  : null;
+
+function requireDatabase(req, res, next) {
+  if (!pool) {
+    return res.status(503).json({
+      error: 'Database is not configured.'
+    });
+  }
+  next();
+}
+
+function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+
+  if (!token) {
+    return res.status(401).json({ error: 'Please log in.' });
+  }
+
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token.' });
+  }
+}
+
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Nexora SMM Panel',
+    status: 'running',
+    version: '1.0.0'
+  });
+});
+
+app.get('/api/health', async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(503).json({
+        status: 'running',
+        database: 'not configured'
+      });
+    }
+
+    await pool.query('SELECT 1');
+
+    res.json({ status: 'ok', database: 'connected' });
+  } catch {
+    res.status(503).json({
+      status: 'error',
+      database: 'unavailable'
+    });
+  }
+});
+
+app.post('/api/auth/register', requireDatabase, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (
+      typeof email !== 'string' ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      typeof password !== 'string' ||
+      password.length < 8 ||
+      password.length > 128
+    ) {
+      return res.status(400).json({
+        error: 'Enter a valid email and a password of 8–128 characters.'
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE lower(email) = $1',
+      [normalizedEmail]
+    );
+
+    if (existing.rowCount) {
+      return res.status(409).json({ error: 'Email already registered.' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const result = await pool.query(
+      `INSERT INTO users (email, password_hash)
+       VALUES ($1, $2)
+       RETURNING id, email, role, balance_cents, created_at`,
+      [normalizedEmail, passwordHash]
+    );
+
+    res.status(201).json({ user: result.rows[0] });
+  } catch (error) {
+    console.error('Registration error:', error.message);
+    res.status(500).json({ error: 'Could not register user.' });
+  }
+});
+
+app.post('/api/auth/login', requireDatabase, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (typeof email !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ error: 'Email and password required.' });
+    }
+
+    const result = await pool.query(
+      'SELECT id, email, password_hash, role FROM users WHERE lower(email) = $1',
+      [email.trim().toLowerCase()]
+    );
+
+    const user = result.rows[0];
+
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+      return res.status(503).json({ error: 'Server authentication is not configured.' });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+
+    res.json({
+      token,
+      user: { id: user.id, email: user.email, role: user.role }
+    });
+  } catch (error) {
+    console.error('Login error:', error.message);
+    res.status(500).json({ error: 'Could not log in.' });
+  }
+});
+
+app.get('/api/me', requireDatabase, requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, email, role, balance_cents, created_at
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    res.json({ user: result.rows[0] });
+  } catch {
+    res.status(500).json({ error: 'Could not load profile.' });
+  }
+});
+
+app.get('/api/services', requireDatabase, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, platform, category, description,
+              price_per_1000_cents, min_quantity, max_quantity
+       FROM services
+       WHERE active = true
+       ORDER BY id DESC`
+    );
+
+    res.json({ services: result.rows });
+  } catch {
+    res.status(500).json({ error: 'Could not load services.' });
+  }
+});
+
+app.post('/api/orders', requireDatabase, requireAuth, async (req, res) => {
+  const { service_id, target_url, quantity } = req.body;
+  const serviceId = Number(service_id);
+  const qty = Number(quantity);
+
+  if (
+    !Number.isSafeInteger(serviceId) ||
+    serviceId < 1 ||
+    !Number.isSafeInteger(qty) ||
+    qty < 1 ||
+    typeof target_url !== 'string' ||
+    target_url.length > 2048
+  ) {
+    return res.status(400).json({ error: 'Invalid order details.' });
+  }
+
+  try {
+    const parsedUrl = new URL(target_url);
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      return res.status(400).json({ error: 'Target must be an HTTP(S) URL.' });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Enter a valid target URL.' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const serviceResult = await client.query(
+      `SELECT id, price_per_1000_cents, min_quantity, max_quantity
+       FROM services WHERE id = $1 AND active = true`,
+      [serviceId]
+    );
+
+    const service = serviceResult.rows[0];
+
+    if (!service) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Service not found.' });
+    }
+
+    if (qty < service.min_quantity || qty > service.max_quantity) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Quantity is outside service limits.' });
+    }
+
+    const amount = Math.ceil(
+      Number(service.price_per_1000_cents) * qty / 1000
+    );
+
+    const balanceResult = await client.query(
+      `UPDATE users
+       SET balance_cents = balance_cents - $1
+       WHERE id = $2 AND balance_cents >= $1
+       RETURNING id`,
+      [amount, req.user.id]
+    );
+
+    if (!balanceResult.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Insufficient balance.' });
+    }
+
+    const orderResult = await client.query(
+      `INSERT INTO orders
+       (user_id, service_id, target_url, quantity, amount_cents, status)
+       VALUES ($1, $2, $3, $4, $5, 'Pending')
+       RETURNING id, service_id, target_url, quantity, amount_cents, status, created_at`,
+      [req.user.id, serviceId, target_url, qty, amount]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({ order: orderResult.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Order error:', error.message);
+    res.status(500).json({ error: 'Could not create order.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/orders', requireDatabase, requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, service_id, target_url, quantity, amount_cents, status,
+              created_at, updated_at
+       FROM orders
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [req.user.id]
+    );
+
+    res.json({ orders: result.rows });
+  } catch {
+    res.status(500).json({ error: 'Could not load orders.' });
+  }
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`Nexora SMM Panel running on port ${PORT}`);
+});
+
+function shutdown() {
+  server.close(async () => {
+    if (pool) await pool.end();
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
