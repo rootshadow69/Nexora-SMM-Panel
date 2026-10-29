@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Premium SMM Panel</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root{color-scheme:dark;--bg:#0b1020;--card:#141c31;--muted:#a8b3cc;--accent:#73a7ff}
+    *{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#0b1020,#121b31);color:#f6f8ff;font:16px system-ui, sans-serif}
+    main{max-width:980px;margin:auto;padding:24px 16px}header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+    h1{font-size:25px;margin:0}p{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+    .card{background:var(--card);border:1px solid #27334d;border-radius:16px;padding:18px;margin:14px 0}
+    label{display:block;color:var(--muted);font-size:13px;margin:12px 0 6px}input,select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #34415d;background:#0d1426;color:#fff;font:inherit}
+    button{background:var(--accent);color:#081225;font-weight:700;border:0;cursor:pointer;margin-top:12px}button.secondary{background:#25324d;color:white}
+    .muted{color:var(--muted);font-size:13px}.pill{display:inline-block;padding:4px 8px;background:#243452;border-radius:99px;font-size:12px}
+    .row{display:flex;justify-content:space-between;gap:12px;align-items:center}.hidden{display:none}
+  </style>
+</head>
+<body>
+<main>
+  <header><div><h1>Premium SMM Panel</h1><p>Services · Orders · Account</p></div><span class="pill" id="mode">Web App</span></header>
+  <section class="grid">
+    <div class="card"><div class="muted">Available balance</div><h2 id="balance">Sign in to view</h2></div>
+    <div class="card"><div class="muted">Total orders shown</div><h2 id="orderCount">—</h2></div>
+    <div class="card"><div class="muted">Services available</div><h2 id="serviceCount">—</h2></div>
+  </section>
+  <section class="card" id="loginCard">
+    <h2>Sign in</h2><p class="muted">Starter version uses email/password. Telegram Mini App identity verification must be implemented server-side before production.</p>
+    <label>Email</label><input id="email" type="email" autocomplete="username" placeholder="you@example.com">
+    <label>Password</label><input id="password" type="password" autocomplete="current-password" placeholder="Password">
+    <button id="loginBtn">Sign in</button><p id="loginMsg" role="status"></p>
+  </section>
+  <section class="card">
+    <h2>Service catalog</h2><div id="services">Loading services…</div>
+  </section>
+  <section class="card">
+    <h2>Create order</h2>
+    <label>Service</label><select id="service"><option value="">Choose a service</option></select>
+    <label>Target URL (public profile/post/video URL)</label><input id="target" type="url" placeholder="https://…">
+    <label>Quantity</label><input id="quantity" type="number" min="1" step="1" value="100">
+    <p class="muted" id="priceHint">Choose a service to view pricing.</p>
+    <button id="orderBtn">Confirm order</button><p id="orderMsg" role="status"></p>
+  </section>
+  <section class="card">
+    <div class="row"><h2>Order history</h2><button class="secondary" id="refreshBtn" style="width:auto">Refresh</button></div>
+    <div id="orders" class="muted">Sign in to view your orders.</div>
+  </section>
+</main>
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); document.getElementById('mode').textContent='Telegram Mini App'; }
+let token = localStorage.getItem('panel_token') || '';
+let services = [];
+const money = cents => new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(Number(cents||0)/100);
+async function api(path, options={}) {
+  const res = await fetch(path,{...options,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`} : {}),...(options.headers||{})}});
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+async function loadServices(){
+  services = await api('/api/services');
+  document.getElementById('serviceCount').textContent=services.length;
+  document.getElementById('services').innerHTML = services.length ? services.map(s =>
+    `<div class="row" style="border-bottom:1px solid #27334d;padding:10px 0"><div><strong>${esc(s.name)}</strong><div class="muted">${esc(s.platform)} · ${esc(s.category)} · ID ${s.id}</div><div class="muted">${esc(s.description||'')}</div></div><div>${money(s.price_per_1000_cents)} / 1k</div></div>`
+  ).join('') : 'No services yet. Add services in the admin API.';
+  const select=document.getElementById('service');
+  select.innerHTML='<option value="">Choose a service</option>'+services.map(s=>`<option value="${s.id}">${esc(s.name)} — ${money(s.price_per_1000_cents)}/1k</option>`).join('');
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function loadDashboard(){
+  if(!token)return;
+  const d=await api('/api/dashboard');
+  document.getElementById('balance').textContent=money(d.balance_cents);
+  document.getElementById('orderCount').textContent=Object.values(d.order_counts||{}).reduce((a,b)=>a+b,0);
+  document.getElementById('loginCard').classList.add('hidden');
+  await loadOrders();
+}
+async function loadOrders(){
+  if(!token)return;
+  const rows=await api('/api/orders');
+  document.getElementById('orders').innerHTML=rows.length?rows.map(o=>`<div style="border-bottom:1px solid #27334d;padding:10px 0"><div class="row"><strong>#${o.id} ${esc(o.service_name)}</strong><span class="pill">${esc(o.status)}</span></div><div class="muted">${esc(o.target_url)} · Qty ${o.quantity} · ${money(o.amount_cents)}</div></div>`).join(''):'No orders yet.';
+}
+document.getElementById('loginBtn').onclick=async()=>{
+  const msg=document.getElementById('loginMsg');msg.textContent='Signing in…';
+  try{const d=await api('/api/auth/login',{method:'POST',body:JSON.stringify({email:document.getElementById('email').value,password:document.getElementById('password').value})});token=d.token;localStorage.setItem('panel_token',token);msg.textContent='Signed in.';await loadDashboard();}
+  catch(e){msg.textContent=e.message;}
+};
+document.getElementById('orderBtn').onclick=async()=>{
+  const msg=document.getElementById('orderMsg');msg.textContent='';
+  try{
+    if(!token)throw new Error('Please sign in first.');
+    const d=await api('/api/orders',{method:'POST',body:JSON.stringify({service_id:Number(document.getElementById('service').value),target_url:document.getElementById('target').value,quantity:Number(document.getElementById('quantity').value)})});
+    msg.textContent=`Order #${d.id} created — ${d.status}.`;await loadDashboard();
+  }catch(e){msg.textContent=e.message;}
+};
+document.getElementById('refreshBtn').onclick=()=>loadOrders().catch(e=>document.getElementById('orders').textContent=e.message);
+document.getElementById('service').onchange=()=>{
+  const s=services.find(x=>x.id===Number(document.getElementById('service').value));
+  document.getElementById('priceHint').textContent=s?`Price: ${money(s.price_per_1000_cents)} per 1,000 · Min ${s.min_quantity} · Max ${s.max_quantity}`:'Choose a service to view pricing.';
+};
+loadServices().then(()=>loadDashboard()).catch(e=>{document.getElementById('services').textContent=e.message;});
+</script>
+</body>
+</html>
